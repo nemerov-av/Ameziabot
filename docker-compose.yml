@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  vpn_bot:
+    build: .
+    container_name: amnezia_telegram_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./bot_data:/app/data
+      - ./.env:/app/.env:ro
+      - ./id_ed25519:/app/id_ed25519:ro
