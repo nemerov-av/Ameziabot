@@ -322,7 +322,6 @@ def get_server_psk() -> str:
 
 def get_awg_obfuscation_params() -> dict:
     """Динамически собирает параметры обфускации с сервера, исключая стандартные ключи WG."""
-    # Список стандартных параметров WG, которые НЕ относятся к обфускации
     standard_keys = {"PrivateKey", "Address", "ListenPort", "PostUp", "PostDown", "SaveConfig", "DNS", "MTU", "Table",
                      "FwMark"}
     params = {}
@@ -338,13 +337,12 @@ def get_awg_obfuscation_params() -> dict:
             if line == "[Interface]":
                 in_interface = True
                 continue
-            elif line.startswith("["):  # Началась секция [Peer]
+            elif line.startswith("["):
                 in_interface = False
                 break
 
             if in_interface and "=" in line:
                 key, val = [x.strip() for x in line.split("=", 1)]
-                # Если ключ нестандартный, значит это параметр обфускации (Jc, Jmin, S1 и т.д.)
                 if key not in standard_keys:
                     params[key] = val
     except Exception as e:
@@ -353,19 +351,27 @@ def get_awg_obfuscation_params() -> dict:
     return params
 
 
-def generate_amnezia_vpn_key(config_content: str, server_endpoint: str, dns: str, obf_params: dict) -> str:
+def generate_amnezia_vpn_key(config_content: str, server_endpoint: str, dns: str, obf_params: dict, client_privkey: str,
+                             client_pubkey: str, client_ip: str, client_psk: str) -> str:
     clean_config = config_content.replace("\r\n", "\n").strip()
     parts = server_endpoint.split(":")
     host_only, port_only = parts[0], parts[1] if len(parts) > 1 else "8081"
 
     last_config_dict = {
         "allowed_ips": ["0.0.0.0/0", "::/0"],
-        "client_ip": clean_config.split("Address = ")[1].split("/")[0],
+        "client_ip": client_ip,
+        "clientId": client_pubkey,
+        "client_priv_key": client_privkey,
+        "client_pub_key": client_pubkey,
         "config": clean_config,
         "hostName": host_only,
         "port": int(port_only),
+        "mtu": "1280",
+        "persistent_keep_alive": "25",
+        "psk_key": client_psk if client_psk else "",
+        "server_pub_key": SERVER_PUBKEY
     }
-    # Динамически вливаем параметры обфускации
+    # Вливаем параметры обфускации в last_config
     last_config_dict.update(obf_params)
 
     awg_block = {
@@ -374,14 +380,20 @@ def generate_amnezia_vpn_key(config_content: str, server_endpoint: str, dns: str
         "protocol_version": "2",
         "transport_proto": "udp",
     }
-    # Динамически вливаем параметры обфускации
+    # Убеждаемся, что пустые строки I2-I5 или нужные ключи I1 присутствуют на верхнем уровне awg_block, если они есть в обф. параметрах
+    for k in ["I1", "I2", "I3", "I4", "I5"]:
+        if k not in obf_params:
+            awg_block[k] = ""
+
     awg_block.update(obf_params)
 
     data = {
         "containers": [{"awg": awg_block, "container": "amnezia-awg2"}],
         "defaultContainer": "amnezia-awg2",
         "description": "AmneziaWG 2.0",
-        "dns1": dns, "dns2": "1.1.1.1", "hostName": host_only,
+        "dns1": dns,
+        "dns2": "1.1.1.1",
+        "hostName": host_only,
     }
     json_bytes = json.dumps(data, ensure_ascii=False).encode("utf-8")
     header = struct.pack(">I", len(json_bytes))
@@ -389,20 +401,21 @@ def generate_amnezia_vpn_key(config_content: str, server_endpoint: str, dns: str
     return f"vpn://{base64.urlsafe_b64encode(header + compressed_data).decode('utf-8').rstrip('=')}"
 
 
-def build_user_config_and_key(client_privkey: str, client_ip: str, client_psk: str):
+def build_user_config_and_key(client_privkey: str, client_pubkey: str, client_ip: str, client_psk: str):
     obf_params = get_awg_obfuscation_params()
 
     # Формируем строки обфускации для текстового конфига
-    obf_str = "\n".join([f"{k} = {v}" for k, v in obf_params.items()])
-    if obf_str:
-        obf_str = "\n" + obf_str
+    obf_str = ""
+    for k, v in obf_params.items():
+        obf_str += f"{k} = {v}\n"
 
     psk_client_line = f"PresharedKey = {client_psk}\n" if client_psk else ""
 
     config_content = f"""[Interface]
-PrivateKey = {client_privkey}
 Address = {client_ip}/32
-DNS = {DNS_SERVER}{obf_str}
+DNS = {DNS_SERVER}
+PrivateKey = {client_privkey}
+{obf_str.strip()}
 
 [Peer]
 PublicKey = {SERVER_PUBKEY}
@@ -410,7 +423,8 @@ PublicKey = {SERVER_PUBKEY}
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 """
-    vpn_key = generate_amnezia_vpn_key(config_content, SERVER_ENDPOINT, DNS_SERVER, obf_params)
+    vpn_key = generate_amnezia_vpn_key(config_content, SERVER_ENDPOINT, DNS_SERVER, obf_params, client_privkey,
+                                       client_pubkey, client_ip, client_psk)
     return config_content, vpn_key
 
 
@@ -451,7 +465,7 @@ def issue_vpn_key_to_user(user_id: int, name: str, phone: str, username: str = "
     conn.commit()
     conn.close()
 
-    config_content, vpn_key = build_user_config_and_key(client_privkey, client_ip, client_psk)
+    config_content, vpn_key = build_user_config_and_key(client_privkey, client_pubkey, client_ip, client_psk)
     response_text = (
         f"🎉 <b>Доступ разрешен!</b>\n\n"
         f"👤 <b>Имя:</b> {name}\n"
@@ -481,7 +495,6 @@ def get_admin_inline_keyboard():
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И НАЧАЛО РАБОТЫ ===
 
 def send_welcome_message(chat_id, first_name):
-    """Выводит стандартное приветственное сообщение с начальной кнопкой."""
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton("🚀 Получить доступ к VPN", callback_data="start_reg_flow"))
     welcome_text = (
@@ -493,7 +506,6 @@ def send_welcome_message(chat_id, first_name):
 
 
 def send_donation_prompt(chat_id):
-    """Выводит сообщение с просьбой поддержать сервер и кнопкой реквизитов."""
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("💳 Показать куда переводить", callback_data="show_donate_info"))
     text = (
@@ -513,7 +525,6 @@ def start_cmd(message):
 
 @bot.message_handler(commands=["cancel"])
 def cancel_cmd(message):
-    """Обработка отмены: сбрасывает состояние и отправляет на главный экран."""
     user_states.pop(message.from_user.id, None)
     bot.clear_step_handler_by_chat_id(message.chat.id)
     bot.send_message(message.chat.id, "🚫 Действие отменено.", reply_markup=types.ReplyKeyboardRemove())
@@ -522,10 +533,10 @@ def cancel_cmd(message):
 
 @bot.message_handler(commands=["register"])
 def register_cmd(message):
-    """Починенная команда /register."""
     user_states.pop(message.from_user.id, None)
     bot.clear_step_handler_by_chat_id(message.chat.id)
-    msg = bot.send_message(message.chat.id, "👤 Пожалуйста, введите ваше <b>Имя</b>:", parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove())
+    msg = bot.send_message(message.chat.id, "👤 Пожалуйста, введите ваше <b>Имя</b>:", parse_mode="HTML",
+                           reply_markup=types.ReplyKeyboardRemove())
     bot.register_next_step_handler(msg, process_name)
 
 
@@ -636,7 +647,6 @@ def process_contact(message):
         parse_mode="HTML", reply_markup=types.ReplyKeyboardRemove(),
     )
 
-    # Выводим сообщение о поддержке сервера
     send_donation_prompt(message.chat.id)
 
     kb_admin = types.InlineKeyboardMarkup(row_width=2)
@@ -695,7 +705,6 @@ def admin_callback_handler(call):
             parse_mode="HTML", reply_markup=get_admin_inline_keyboard(),
         )
 
-    # --- Белый список ---
     elif action == "admin_wl_menu":
         bot.answer_callback_query(call.id)
         kb = types.InlineKeyboardMarkup(row_width=1)
@@ -753,7 +762,6 @@ def admin_callback_handler(call):
                                parse_mode="HTML")
         bot.register_next_step_handler(msg, process_add_whitelist_phone)
 
-    # --- Управление пользователями ---
     elif action == "admin_users_list":
         bot.answer_callback_query(call.id)
         conn = sqlite3.connect(DB_PATH)
@@ -777,7 +785,6 @@ def admin_callback_handler(call):
             parse_mode="HTML", reply_markup=keyboard,
         )
 
-    # --- Трафик ---
     elif action == "admin_traffic":
         bot.answer_callback_query(call.id, "Загрузка трафика...")
         try:
@@ -826,8 +833,6 @@ def process_add_whitelist_phone(message):
     bot.send_message(message.chat.id, f"✅ Номер <code>{phone}</code> добавлен в белый список!", parse_mode="HTML")
 
 
-# === ПРОФИЛЬ И ДЕЙСТВИЯ (ВЫГРУЗКА, УДАЛЕНИЕ, ЛИМИТЫ) ===
-
 @bot.callback_query_handler(
     func=lambda call: call.data.startswith("adm_u_") or call.data.startswith("adm_exp_") or call.data.startswith(
         "adm_del_") or call.data.startswith("adm_lim_"))
@@ -837,7 +842,6 @@ def admin_user_actions_handler(call):
 
     action = call.data
 
-    # Просмотр карточки пользователя
     if action.startswith("adm_u_"):
         bot.answer_callback_query(call.id)
         target_uid = int(action.replace("adm_u_", ""))
@@ -886,7 +890,6 @@ def admin_user_actions_handler(call):
         bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML",
                               reply_markup=keyboard)
 
-    # Изменение лимита
     elif action.startswith("adm_lim_"):
         bot.answer_callback_query(call.id)
         target_uid = int(action.replace("adm_lim_", ""))
@@ -904,14 +907,13 @@ def admin_user_actions_handler(call):
         )
         bot.register_next_step_handler(msg, process_change_limit, phone)
 
-    # Выгрузка конкретного ключа
     elif action.startswith("adm_exp_"):
         bot.answer_callback_query(call.id, "Подготовка ключа...")
         row_id = int(action.replace("adm_exp_", ""))
 
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT name, phone, ip, privkey, user_id FROM users WHERE id = ?", (row_id,))
+        cursor.execute("SELECT name, phone, ip, privkey, pubkey, user_id FROM users WHERE id = ?", (row_id,))
         row = cursor.fetchone()
         conn.close()
 
@@ -919,7 +921,7 @@ def admin_user_actions_handler(call):
             bot.send_message(call.message.chat.id, "❌ Ключ не найден!")
             return
 
-        name, phone, ip, privkey, uid = row
+        name, phone, ip, privkey, pubkey, uid = row
         keyboard = types.InlineKeyboardMarkup().add(
             types.InlineKeyboardButton("⬅️ Назад в профиль", callback_data=f"adm_u_{uid}"))
 
@@ -928,14 +930,13 @@ def admin_user_actions_handler(call):
             return
 
         psk = get_server_psk()
-        config_content, vpn_key = build_user_config_and_key(privkey, ip, psk)
+        config_content, vpn_key = build_user_config_and_key(privkey, pubkey, ip, psk)
 
         text = f"🔑 <b>Ключ подключения:</b>\n📞 <code>{phone}</code> | 🌐 <code>{ip}</code>\n\n<code>{vpn_key}</code>"
         bot.send_message(call.message.chat.id, text, parse_mode="HTML", reply_markup=keyboard)
         filename = f"{name.replace(' ', '_')}_{ip}_Amnezia.conf"
         bot.send_document(chat_id=call.message.chat.id, document=(filename, config_content.encode("utf-8")))
 
-    # Удаление конкретного ключа
     elif action.startswith("adm_del_"):
         bot.answer_callback_query(call.id, "Удаление ключа...")
         row_id = int(action.replace("adm_del_", ""))
@@ -974,8 +975,6 @@ def process_change_limit(message, phone):
     except ValueError:
         bot.send_message(message.chat.id, "❌ Ошибка. Нужно ввести число.")
 
-
-# === ОДОБРЕНИЕ И ОТКЛОНЕНИЕ ЗАЯВОК ===
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(("approve_", "reject_")))
 def admin_approval_decision(call):
