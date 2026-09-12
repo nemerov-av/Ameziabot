@@ -320,25 +320,63 @@ def get_server_psk() -> str:
     return ""
 
 
-def generate_amnezia_vpn_key(config_content: str, server_endpoint: str, dns: str) -> str:
+def get_awg_obfuscation_params() -> dict:
+    """Динамически собирает параметры обфускации с сервера, исключая стандартные ключи WG."""
+    # Список стандартных параметров WG, которые НЕ относятся к обфускации
+    standard_keys = {"PrivateKey", "Address", "ListenPort", "PostUp", "PostDown", "SaveConfig", "DNS", "MTU", "Table",
+                     "FwMark"}
+    params = {}
+    try:
+        output = run_ssh_container_cmd(f"cat /opt/amnezia/awg/{INTERFACE_NAME}.conf")
+        in_interface = False
+
+        for line in output.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            if line == "[Interface]":
+                in_interface = True
+                continue
+            elif line.startswith("["):  # Началась секция [Peer]
+                in_interface = False
+                break
+
+            if in_interface and "=" in line:
+                key, val = [x.strip() for x in line.split("=", 1)]
+                # Если ключ нестандартный, значит это параметр обфускации (Jc, Jmin, S1 и т.д.)
+                if key not in standard_keys:
+                    params[key] = val
+    except Exception as e:
+        print(f"Ошибка получения параметров обфускации с сервера: {e}")
+
+    return params
+
+
+def generate_amnezia_vpn_key(config_content: str, server_endpoint: str, dns: str, obf_params: dict) -> str:
     clean_config = config_content.replace("\r\n", "\n").strip()
     parts = server_endpoint.split(":")
     host_only, port_only = parts[0], parts[1] if len(parts) > 1 else "8081"
+
     last_config_dict = {
-        "Jc": "4", "Jmax": "50", "Jmin": "10", "S1": "80", "S2": "78", "S3": "7", "S4": "5",
         "allowed_ips": ["0.0.0.0/0", "::/0"],
         "client_ip": clean_config.split("Address = ")[1].split("/")[0],
         "config": clean_config,
         "hostName": host_only,
         "port": int(port_only),
     }
+    # Динамически вливаем параметры обфускации
+    last_config_dict.update(obf_params)
+
     awg_block = {
-        "Jc": "4", "Jmax": "50", "Jmin": "10", "S1": "80", "S2": "78", "S3": "7", "S4": "5",
         "last_config": json.dumps(last_config_dict, ensure_ascii=False),
         "port": str(port_only),
         "protocol_version": "2",
         "transport_proto": "udp",
     }
+    # Динамически вливаем параметры обфускации
+    awg_block.update(obf_params)
+
     data = {
         "containers": [{"awg": awg_block, "container": "amnezia-awg2"}],
         "defaultContainer": "amnezia-awg2",
@@ -352,18 +390,19 @@ def generate_amnezia_vpn_key(config_content: str, server_endpoint: str, dns: str
 
 
 def build_user_config_and_key(client_privkey: str, client_ip: str, client_psk: str):
+    obf_params = get_awg_obfuscation_params()
+
+    # Формируем строки обфускации для текстового конфига
+    obf_str = "\n".join([f"{k} = {v}" for k, v in obf_params.items()])
+    if obf_str:
+        obf_str = "\n" + obf_str
+
     psk_client_line = f"PresharedKey = {client_psk}\n" if client_psk else ""
+
     config_content = f"""[Interface]
 PrivateKey = {client_privkey}
 Address = {client_ip}/32
-DNS = {DNS_SERVER}
-Jc = 4
-Jmin = 10
-Jmax = 50
-S1 = 80
-S2 = 78
-S3 = 7
-S4 = 5
+DNS = {DNS_SERVER}{obf_str}
 
 [Peer]
 PublicKey = {SERVER_PUBKEY}
@@ -371,7 +410,7 @@ PublicKey = {SERVER_PUBKEY}
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 """
-    vpn_key = generate_amnezia_vpn_key(config_content, SERVER_ENDPOINT, DNS_SERVER)
+    vpn_key = generate_amnezia_vpn_key(config_content, SERVER_ENDPOINT, DNS_SERVER, obf_params)
     return config_content, vpn_key
 
 
