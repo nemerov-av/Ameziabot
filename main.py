@@ -38,6 +38,9 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "vpn_users.db")
 
+# === НАСТРОЙКИ ДОНАТА ===
+ALPHA_CART = os.getenv("ALPHA_CART")
+USDT = os.getenv("USDT")
 bot = telebot.TeleBot(BOT_TOKEN)
 user_states = {}
 
@@ -552,8 +555,8 @@ def cb_show_donate_info(call):
     bot.answer_callback_query(call.id)
     donate_info = (
         "💳 <b>Реквизиты для поддержки серверов:</b>\n\n"
-        "• <b>Банковская карта / СБП:</b> <code>+79000000000</code>\n"
-        "• <b>USDT (TRC20):</b> <code>УКАЖИТЕ_ВАШ_КОШЕЛЕК</code>\n\n"
+        f"• <b>Банковская карта / СБП:</b> <code>{ALPHA_CART}</code>\n"
+        f"• <b>USDT (ERC20):</b> <code>{USDT}</code>\n\n"
         "Огромное спасибо за поддержку! ❤️"
     )
     bot.send_message(call.message.chat.id, donate_info, parse_mode="HTML")
