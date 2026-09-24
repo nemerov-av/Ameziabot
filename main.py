@@ -482,6 +482,93 @@ def issue_vpn_key_to_user(user_id: int, name: str, phone: str, username: str = "
     bot.send_document(chat_id=user_id, document=(filename, config_content.encode("utf-8")))
 
 
+def restore_users_to_server() -> tuple:
+    """Берет пользователей из БД и прописывает их в ядро AWG, конфиг и clientsTable"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT pubkey, ip, name FROM users WHERE pubkey IS NOT NULL AND ip IS NOT NULL")
+    users = cursor.fetchall()
+    conn.close()
+
+    if not users:
+        return 0, 0
+
+    # 1. Читаем текущий clientsTable
+    try:
+        clients_raw = run_ssh_container_cmd("cat /opt/amnezia/awg/clientsTable")
+        clients_list = json.loads(clients_raw) if clients_raw else []
+    except Exception:
+        clients_list = []
+
+    existing_pubkeys_in_json = {c.get("clientId") for c in clients_list}
+
+    # 2. Читаем текущий конфиг awg0.conf
+    try:
+        conf_content = run_ssh_container_cmd(f"cat /opt/amnezia/awg/{INTERFACE_NAME}.conf")
+    except Exception:
+        conf_content = ""
+
+    psk = get_server_psk()
+    if psk:
+        run_ssh_container_cmd(f'sh -c "echo {psk} > /tmp/psk.key"')
+
+    restored_peers = 0
+    conf_append_block = ""
+
+    # 3. Восстанавливаем каждого пользователя
+    for pubkey, ip, name in users:
+        pubkey_clean = pubkey.strip()
+        ip_clean = ip.strip()
+
+        # А. Добавляем пира в активный интерфейс "на лету" (чтобы заработало без перезагрузки)
+        try:
+            if psk:
+                run_ssh_container_cmd(
+                    f'awg set {INTERFACE_NAME} peer "{pubkey_clean}" preshared-key /tmp/psk.key allowed-ips {ip_clean}/32')
+            else:
+                run_ssh_container_cmd(f'awg set {INTERFACE_NAME} peer "{pubkey_clean}" allowed-ips {ip_clean}/32')
+            restored_peers += 1
+        except Exception as e:
+            print(f"Ошибка awg set для {pubkey_clean}: {e}")
+
+        # Б. Добавляем в файл conf (для выживания при следующих перезагрузках)
+        if pubkey_clean not in conf_content and pubkey_clean not in conf_append_block:
+            psk_str = f"PresharedKey = {psk}\n" if psk else ""
+            conf_append_block += f"\n[Peer]\nPublicKey = {pubkey_clean}\n{psk_str}AllowedIPs = {ip_clean}/32\n"
+
+        # В. Добавляем в clientsTable (для корректной работы Amnezia)
+        if pubkey_clean not in existing_pubkeys_in_json:
+            clients_list.append({
+                "clientId": pubkey_clean,
+                "userData": {
+                    "allowed_ips": f"{ip_clean}/32",
+                    "clientName": name,
+                    "creationDate": datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y"),
+                    "dataReceived": "0.00 B",
+                    "dataSent": "0.00 B",
+                    "latestHandshake": ""
+                }
+            })
+            existing_pubkeys_in_json.add(pubkey_clean)
+
+    if psk:
+        run_ssh_container_cmd("rm /tmp/psk.key")
+
+    # 4. Сохраняем дополненный конфиг
+    if conf_append_block:
+        b64_append = base64.b64encode(conf_append_block.encode("utf-8")).decode("utf-8")
+        run_ssh_container_cmd(f'sh -c "echo \'{b64_append}\' | base64 -d >> /opt/amnezia/awg/{INTERFACE_NAME}.conf"')
+
+    # 5. Сохраняем обновленный clientsTable
+    try:
+        b64_json = base64.b64encode(json.dumps(clients_list, indent=4, ensure_ascii=False).encode("utf-8")).decode(
+            "utf-8")
+        run_ssh_container_cmd(f'sh -c "echo \'{b64_json}\' | base64 -d > /opt/amnezia/awg/clientsTable"')
+    except Exception as e:
+        print(f"Ошибка записи clientsTable: {e}")
+
+    return len(users), restored_peers
+
 # === КЛАВИАТУРЫ ===
 
 def get_admin_inline_keyboard():
@@ -490,6 +577,7 @@ def get_admin_inline_keyboard():
         types.InlineKeyboardButton("📋 Белый список номеров", callback_data="admin_wl_menu"),
         types.InlineKeyboardButton("👥 Управление пользователями", callback_data="admin_users_list"),
         types.InlineKeyboardButton("📊 Просмотреть трафик", callback_data="admin_traffic"),
+        types.InlineKeyboardButton("🔄 Синхр. БД -> Сервер", callback_data="admin_sync_to_server"), # Новая кнопка
         types.InlineKeyboardButton("⬅️ Скрыть панель", callback_data="admin_back_to_main"),
     )
     return keyboard
@@ -707,6 +795,18 @@ def admin_callback_handler(call):
             chat_id=call.message.chat.id, message_id=call.message.message_id,
             parse_mode="HTML", reply_markup=get_admin_inline_keyboard(),
         )
+
+    elif action == "admin_sync_to_server":
+        bot.answer_callback_query(call.id, "Синхронизация запущена... Это займет несколько секунд.")
+        try:
+            total_users, success = restore_users_to_server()
+            bot.send_message(
+                call.message.chat.id,
+                f"✅ <b>Синхронизация завершена!</b>\n\nПользователей в БД: <b>{total_users}</b>\nУспешно добавлено в ядро сервера: <b>{success}</b>\n\n<i>Теперь пользователи могут подключаться.</i>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"❌ Ошибка синхронизации: {e}")
 
     elif action == "admin_wl_menu":
         bot.answer_callback_query(call.id)
@@ -1030,6 +1130,13 @@ def admin_approval_decision(call):
 
 if __name__ == "__main__":
     init_db()
+    print("Автоматическое восстановление пользователей на сервер...")
+    try:
+        restore_users_to_server()
+        print("Пользователи успешно синхронизированы.")
+    except Exception as e:
+        print(f"Сбой автосинхронизации: {e}")
+
     bot.remove_webhook()
     print("Бот со всеми обновлениями запущен...")
     bot.infinity_polling()
