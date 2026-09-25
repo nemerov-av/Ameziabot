@@ -9,6 +9,8 @@ import paramiko
 import telebot
 from telebot import types
 from dotenv import load_dotenv
+import threading
+import time
 
 # Загрузка переменных из .env
 load_dotenv()
@@ -60,20 +62,35 @@ def init_db():
         columns = [col[1] for col in cursor.fetchall()]
         if 'about' not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN about TEXT")
+        if 'traffic_month' not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN traffic_month INTEGER DEFAULT 0")
+        if 'traffic_total' not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN traffic_total INTEGER DEFAULT 0")
+        if 'last_reset_month' not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_reset_month TEXT DEFAULT 'Никогда'")
+        if 'last_reset_total' not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_reset_total TEXT DEFAULT 'Никогда'")
+        if 'last_seen_bytes' not in columns:
+            cursor.execute("ALTER TABLE users ADD COLUMN last_seen_bytes INTEGER DEFAULT 0")
     else:
         cursor.execute("""
-            CREATE TABLE users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                name TEXT,
-                phone TEXT,
-                username TEXT,
-                ip TEXT,
-                pubkey TEXT,
-                privkey TEXT,
-                about TEXT
-            )
-        """)
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    name TEXT,
+                    phone TEXT,
+                    username TEXT,
+                    ip TEXT,
+                    pubkey TEXT,
+                    privkey TEXT,
+                    about TEXT,
+                    traffic_month INTEGER DEFAULT 0,
+                    traffic_total INTEGER DEFAULT 0,
+                    last_reset_month TEXT DEFAULT 'Никогда',
+                    last_reset_total TEXT DEFAULT 'Никогда',
+                    last_seen_bytes INTEGER DEFAULT 0
+                )
+            """)
 
     # Таблица заявок
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_requests'")
@@ -171,6 +188,55 @@ def get_user_key_count(phone: str) -> int:
 
 # === ВЗАИМОДЕЙСТВИЕ С СЕРВЕРОМ ===
 
+def update_all_traffic():
+    """Стягивает трафик из ядра, вычисляет дельту и сохраняет в БД"""
+    try:
+        output = run_ssh_container_cmd(f"awg show {INTERFACE_NAME} transfer")
+    except Exception:
+        try:
+            output = run_ssh_container_cmd(f"wg show {INTERFACE_NAME} transfer")
+        except Exception:
+            output = ""
+
+    current_stats = {}
+    for line in output.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 3:
+            # Суммируем полученные и отправленные байты (Rx + Tx)
+            current_stats[parts[0]] = int(parts[1]) + int(parts[2])
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT pubkey, traffic_month, traffic_total, last_seen_bytes FROM users WHERE pubkey IS NOT NULL")
+    users = cursor.fetchall()
+
+    for pubkey, t_month, t_total, last_seen in users:
+        t_month = t_month or 0
+        t_total = t_total or 0
+        last_seen = last_seen or 0
+
+        current_bytes = current_stats.get(pubkey, 0)
+
+        # Если трафик увеличился, вычисляем дельту. Если ядро сбросилось (current_bytes < last_seen), дельта = current_bytes
+        if current_bytes >= last_seen:
+            delta = current_bytes - last_seen
+        else:
+            delta = current_bytes
+
+        if delta > 0:
+            t_month += delta
+            t_total += delta
+            cursor.execute("""
+                UPDATE users 
+                SET traffic_month = ?, traffic_total = ?, last_seen_bytes = ? 
+                WHERE pubkey = ?
+            """, (t_month, t_total, current_bytes, pubkey))
+        elif current_bytes < last_seen:
+            # Просто обновляем 'последнее увиденное', если трафик обнулился, а дельты нет
+            cursor.execute("UPDATE users SET last_seen_bytes = ? WHERE pubkey = ?", (current_bytes, pubkey))
+
+    conn.commit()
+    conn.close()
 def run_ssh_container_cmd(cmd: str) -> str:
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -881,7 +947,6 @@ def admin_callback_handler(call):
         for uid, name, phone in users:
             keyboard.add(types.InlineKeyboardButton(f"👤 {name} ({phone})", callback_data=f"adm_u_{uid}"))
         keyboard.add(types.InlineKeyboardButton("⬅️ Назад в Админ-панель", callback_data="admin_back_to_panel"))
-
         bot.edit_message_text(
             "👥 <b>Выберите пользователя для просмотра:</b>",
             chat_id=call.message.chat.id, message_id=call.message.message_id,
@@ -890,38 +955,40 @@ def admin_callback_handler(call):
 
     elif action == "admin_traffic":
         bot.answer_callback_query(call.id, "Загрузка трафика...")
-        try:
-            output = run_ssh_container_cmd(f"awg show {INTERFACE_NAME} transfer")
-        except Exception:
-            try:
-                output = run_ssh_container_cmd(f"wg show {INTERFACE_NAME} transfer")
-            except Exception:
-                output = ""
-
-        traffic_map = {}
-        for line in output.splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 3:
-                traffic_map[parts[0]] = int(parts[1]) + int(parts[2])
-
+        update_all_traffic()  # Обязательно обновляем перед показом
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name, ip, pubkey, phone FROM users ORDER BY name")
+        cursor.execute(
+            "SELECT user_id, name, ip, pubkey, phone, traffic_month, traffic_total, last_reset_month FROM users ORDER BY name")
         users = cursor.fetchall()
         conn.close()
-
         if not users:
             bot.send_message(call.message.chat.id, "📭 В базе нет пользователей.")
             return
 
         report = "📊 <b>Статистика трафика:</b>\n\n"
-        for uid, name, ip, pubkey, phone in users:
-            bytes_used = traffic_map.get(pubkey, 0)
-            report += f"👤 <b>{name}</b> ({ip})\n└ Трафик: <b>{format_bytes(bytes_used)}</b>\n\n"
-
-        keyboard = types.InlineKeyboardMarkup()
+        for uid, name, ip, pubkey, phone, t_month, t_total, lr_month in users:
+            t_month = t_month or 0
+            t_total = t_total or 0
+            report += f"👤 <b>{name}</b> ({ip})\n"
+            report += f"├ За месяц: <b>{format_bytes(t_month)}</b> <i>(сброс: {lr_month})</i>\n"
+            report += f"└ Общий: <b>{format_bytes(t_total)}</b>\n\n"
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'За месяц' у всех", callback_data="adm_reset_all_month"))
         keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_panel"))
-        bot.send_message(call.message.chat.id, report, parse_mode="HTML", reply_markup=keyboard)
+        bot.edit_message_text(report, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                              parse_mode="HTML", reply_markup=keyboard)
+
+    elif action == "adm_reset_all_month":
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET traffic_month = 0, last_reset_month = ?", (now_str,))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "Трафик за месяц сброшен у всех!", show_alert=True)
+        call.data = "admin_traffic"
+        admin_callback_handler(call)
 
 
 def process_add_whitelist_phone(message):
@@ -938,7 +1005,7 @@ def process_add_whitelist_phone(message):
 
 @bot.callback_query_handler(
     func=lambda call: call.data.startswith("adm_u_") or call.data.startswith("adm_exp_") or call.data.startswith(
-        "adm_del_") or call.data.startswith("adm_lim_"))
+        "adm_del_") or call.data.startswith("adm_lim_") or call.data.startswith("adm_rst_m_") or call.data.startswith("adm_rst_t_"))
 def admin_user_actions_handler(call):
     if not is_admin(call.from_user.id):
         return
@@ -949,9 +1016,13 @@ def admin_user_actions_handler(call):
         bot.answer_callback_query(call.id)
         target_uid = int(action.replace("adm_u_", ""))
 
+        update_all_traffic()  # Считаем свежий трафик перед открытием
+
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT id, name, phone, username, ip, about FROM users WHERE user_id = ?", (target_uid,))
+        cursor.execute(
+            "SELECT id, name, phone, username, ip, about, traffic_month, traffic_total, last_reset_month, last_reset_total FROM users WHERE user_id = ?",
+            (target_uid,))
         user_keys = cursor.fetchall()
         conn.close()
 
@@ -964,6 +1035,11 @@ def admin_user_actions_handler(call):
         username = user_keys[0][3]
         about = user_keys[0][5] if len(user_keys[0]) > 5 and user_keys[0][5] else "Не указано"
 
+        t_month_sum = sum((r[6] or 0) for r in user_keys)
+        t_total_sum = sum((r[7] or 0) for r in user_keys)
+        lr_month = user_keys[0][8] or "Никогда"
+        lr_total = user_keys[0][9] or "Никогда"
+
         current_keys = get_user_key_count(phone)
         max_keys = get_max_keys(phone)
 
@@ -975,13 +1051,20 @@ def admin_user_actions_handler(call):
             f"ℹ️ <b>О себе:</b> {about}\n"
             f"🆔 <b>ID:</b> <code>{target_uid}</code>\n"
             f"🔑 <b>Лимит ключей на номер:</b> {max_keys} (выпущено {current_keys})\n\n"
+            f"📊 <b>Трафик:</b>\n"
+            f"├ За месяц: <b>{format_bytes(t_month_sum)}</b> <i>(с {lr_month})</i>\n"
+            f"└ Общий: <b>{format_bytes(t_total_sum)}</b> <i>(с {lr_total})</i>\n\n"
             f"🌐 <b>Подключенные IP (Ключи):</b>\n"
         )
 
         keyboard = types.InlineKeyboardMarkup(row_width=1)
-        keyboard.add(types.InlineKeyboardButton(f"⚙️ Изменить лимит ключей", callback_data=f"adm_lim_{target_uid}"))
+        keyboard.add(
+            types.InlineKeyboardButton("🔄 Сбросить трафик 'за месяц'", callback_data=f"adm_rst_m_{target_uid}"),
+            types.InlineKeyboardButton("🔄 Сбросить 'общий' трафик", callback_data=f"adm_rst_t_{target_uid}"),
+            types.InlineKeyboardButton("⚙️ Изменить лимит ключей", callback_data=f"adm_lim_{target_uid}")
+        )
 
-        for idx, (db_id, _, _, _, ip, _) in enumerate(user_keys, 1):
+        for idx, (db_id, _, _, _, ip, _, _, _, _, _) in enumerate(user_keys, 1):
             text += f"{idx}. <code>{ip}</code>\n"
             keyboard.add(
                 types.InlineKeyboardButton(f"📥 Выгрузить ключ {ip}", callback_data=f"adm_exp_{db_id}"),
@@ -1066,7 +1149,31 @@ def admin_user_actions_handler(call):
         else:
             bot.send_message(call.message.chat.id, "❌ Ключ не найден!")
         conn.close()
+    elif action.startswith("adm_rst_m_"):
+        target_uid = int(action.replace("adm_rst_m_", ""))
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET traffic_month = 0, last_reset_month = ? WHERE user_id = ?",
+                       (now_str, target_uid))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "Трафик за месяц сброшен!", show_alert=True)
+        call.data = f"adm_u_{target_uid}"
+        admin_user_actions_handler(call)
 
+    elif action.startswith("adm_rst_t_"):
+        target_uid = int(action.replace("adm_rst_t_", ""))
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET traffic_total = 0, last_reset_total = ? WHERE user_id = ?",
+                       (now_str, target_uid))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "Общий трафик сброшен!", show_alert=True)
+        call.data = f"adm_u_{target_uid}"
+        admin_user_actions_handler(call)
 
 def process_change_limit(message, phone):
     try:
@@ -1136,6 +1243,17 @@ if __name__ == "__main__":
         print("Пользователи успешно синхронизированы.")
     except Exception as e:
         print(f"Сбой автосинхронизации: {e}")
+
+    # Запускаем фоновый поток, который каждые 5 минут синхронизирует трафик
+    def traffic_saver_thread():
+        while True:
+            time.sleep(300) # Раз в 5 минут
+            try:
+                update_all_traffic()
+            except Exception as e:
+                print(f"Ошибка фонового обновления трафика: {e}")
+
+    threading.Thread(target=traffic_saver_thread, daemon=True).start()
 
     bot.remove_webhook()
     print("Бот со всеми обновлениями запущен...")
