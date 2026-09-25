@@ -973,14 +973,13 @@ def admin_callback_handler(call):
             report += f"├ За месяц: <b>{format_bytes(t_month)}</b> <i>(сброс: {lr_month})</i>\n"
             report += f"└ Общий: <b>{format_bytes(t_total)}</b>\n\n"
         keyboard = types.InlineKeyboardMarkup(row_width=1)
-        keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'За месяц' у всех", callback_data="adm_reset_all_month"))
-        keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'Общий' у всех",
-                                                callback_data="adm_reset_all_total"))  # <--- Добавлена кнопка
+        keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'За месяц' у всех", callback_data="admin_reset_all_month"))
+        keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'Общий' у всех", callback_data="admin_reset_all_total"))
         keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_panel"))
         bot.edit_message_text(report, chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode="HTML", reply_markup=keyboard)
 
-    elif action == "adm_reset_all_month":
+    elif action == "admin_reset_all_month":
         now_str = datetime.datetime.now().strftime("%Y-%m-%d")
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -991,7 +990,7 @@ def admin_callback_handler(call):
         call.data = "admin_traffic"
         admin_callback_handler(call)
 
-    elif action == "adm_reset_all_total":  # <--- Новый обработчик
+    elif action == "admin_reset_all_total":
         now_str = datetime.datetime.now().strftime("%Y-%m-%d")
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
