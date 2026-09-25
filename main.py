@@ -965,7 +965,6 @@ def admin_callback_handler(call):
         if not users:
             bot.send_message(call.message.chat.id, "📭 В базе нет пользователей.")
             return
-
         report = "📊 <b>Статистика трафика:</b>\n\n"
         for uid, name, ip, pubkey, phone, t_month, t_total, lr_month in users:
             t_month = t_month or 0
@@ -975,6 +974,8 @@ def admin_callback_handler(call):
             report += f"└ Общий: <b>{format_bytes(t_total)}</b>\n\n"
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'За месяц' у всех", callback_data="adm_reset_all_month"))
+        keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'Общий' у всех",
+                                                callback_data="adm_reset_all_total"))  # <--- Добавлена кнопка
         keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="admin_back_to_panel"))
         bot.edit_message_text(report, chat_id=call.message.chat.id, message_id=call.message.message_id,
                               parse_mode="HTML", reply_markup=keyboard)
@@ -987,6 +988,17 @@ def admin_callback_handler(call):
         conn.commit()
         conn.close()
         bot.answer_callback_query(call.id, "Трафик за месяц сброшен у всех!", show_alert=True)
+        call.data = "admin_traffic"
+        admin_callback_handler(call)
+
+    elif action == "adm_reset_all_total":  # <--- Новый обработчик
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET traffic_total = 0, last_reset_total = ?", (now_str,))
+        conn.commit()
+        conn.close()
+        bot.answer_callback_query(call.id, "Общий трафик сброшен у всех!", show_alert=True)
         call.data = "admin_traffic"
         admin_callback_handler(call)
 
