@@ -953,25 +953,29 @@ def admin_callback_handler(call):
             parse_mode="HTML", reply_markup=keyboard,
         )
 
+
     elif action == "admin_traffic":
         bot.answer_callback_query(call.id, "Загрузка трафика...")
         update_all_traffic()  # Обязательно обновляем перед показом
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+        # Добавлено поле last_reset_total в выборку
         cursor.execute(
-            "SELECT user_id, name, ip, pubkey, phone, traffic_month, traffic_total, last_reset_month FROM users ORDER BY name")
+            "SELECT user_id, name, ip, pubkey, phone, traffic_month, traffic_total, last_reset_month, last_reset_total FROM users ORDER BY name")
         users = cursor.fetchall()
         conn.close()
         if not users:
             bot.send_message(call.message.chat.id, "📭 В базе нет пользователей.")
             return
         report = "📊 <b>Статистика трафика:</b>\n\n"
-        for uid, name, ip, pubkey, phone, t_month, t_total, lr_month in users:
+        for uid, name, ip, pubkey, phone, t_month, t_total, lr_month, lr_total in users:
             t_month = t_month or 0
             t_total = t_total or 0
+            lr_month = lr_month or "Никогда"
+            lr_total = lr_total or "Никогда"
             report += f"👤 <b>{name}</b> ({ip})\n"
             report += f"├ За месяц: <b>{format_bytes(t_month)}</b> <i>(сброс: {lr_month})</i>\n"
-            report += f"└ Общий: <b>{format_bytes(t_total)}</b>\n\n"
+            report += f"└ Общий: <b>{format_bytes(t_total)}</b> <i>(сброс: {lr_total})</i>\n\n"
         keyboard = types.InlineKeyboardMarkup(row_width=1)
         keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'За месяц' у всех", callback_data="admin_reset_all_month"))
         keyboard.add(types.InlineKeyboardButton("🔄 Сбросить 'Общий' у всех", callback_data="admin_reset_all_total"))
