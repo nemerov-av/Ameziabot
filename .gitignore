@@ -1,0 +1,5 @@
+.env
+id_ed25519
+bot_data/
+__pycache__/
+*.db
